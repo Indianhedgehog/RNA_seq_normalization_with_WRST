@@ -1,0 +1,277 @@
+---
+title: "RNA_Seq_analysis_with_Wilcoxon_rank_sum_test"
+tested_on: "R version 4.2.0"
+author: "Rajesh Pal"
+date: '2022-09-14'
+output: html_document
+---
+
+**The following script pulls the desired column from the TSV files, normalizes the raw counts using VST and performs wilcoxon rank sum test.**
+
+**Input required : ".tsv" files**
+
+**You can also save huge files/data/list basically anything using the qsave command at any point **
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE }
+library("qs")
+library("tidyverse")
+library("DESeq2")
+library("gplots")
+library("genefilter")
+library("pheatmap")
+library("RColorBrewer")
+library("readr")
+library("edgeR")
+
+library("plotly") ## these packages might not install on cluster 
+library("Biobase") ##however you can try this on your PC
+#library("umap")    ##after exporting the normalized matrix
+library("ggplot2")
+
+```
+
+
+**Reading the file and creating the raw count matrix**
+
+
+```{r message=FALSE, warning=FALSE}
+
+setwd("/omics/odcf/analysis/hipo/hipo_018/rajesh_test/hipo_021_RNA/test/")
+ 
+files <- list.files(pattern = "*.tsv")
+ 
+list <- lapply(files, read_tsv)
+
+####saving the list 
+#qsave(list, "list.qs")
+###list = qread("list.qs")
+
+####extracting the column
+mat <- lapply(list, '[[', 11) ##define the column number you want to extract
+
+final_matrix <- sapply(list, '[[',11)
+
+####read a file from the list and write the gene names on the first column
+sample_file <-  read_tsv("metastasis_H021-FFMVY6.fpkm_tpm.featureCounts.tsv")
+rownames(final_matrix) <- sample_file$name
+
+
+names <- gsub("^([^.]+)[.].*","\\1", basename(files))  
+colnames(final_matrix) <- names
+
+
+counts <- as.data.frame(final_matrix)
+
+#qsave(counts, "counts.qs")
+#counts = qread("counts.qs")
+
+##saving the the raw count matrix as CSV. You can also directly read the saved qs file using qread function  just above!
+#write.csv(counts, "rna_seq_raw_counts_all_without_any_filter.csv")
+
+```
+<br>
+
+**In case if you still prefer to read it from csv file, here it is.**
+
+
+```{r message=FALSE}
+
+counts = read_csv("/omics/odcf/analysis/hipo/hipo_018/rajesh_test/hipo_021_RNA/test/rna_seq_raw_counts_all_without_any_filter.csv")
+
+counts = as.data.frame(counts)
+
+rownames(counts) <- counts[, 1]
+counts <- counts[,-1] 
+
+```
+
+<br>
+
+**Reading the metadata file and intersecting with the original count matrix**
+**Use this to filter out samples you don't need**
+
+``` {r message=FALSE}
+
+##read the external file you want to intersect 
+read <- read_csv("/omics/odcf/analysis/hipo/hipo_021/RP_all_RNAseq/final.csv")
+
+##convert it in to character vector 
+keep <- c(read$col)
+
+##filtered dataset
+ans <- intersect(names(counts), keep)
+
+df1 = counts[,ans]
+
+```
+
+<br>
+**Creating a table with conditions and matching the samples with their conditions**
+
+``` {r message=FALSE}
+
+read$lab_names = read$col
+sampleTable = data.frame(condition = read$Annotation[match(ans, read$lab_names)])
+rownames(sampleTable) = colnames(df1)
+
+```
+
+<br>
+**You can also create fake conditions if you don't have your conditions as of now**
+
+``` {r message = FALSE}
+
+# condition = rep(c("A1", "B1"), times = c(1652, 1653))
+# samplelist = as.data.frame(condition)
+# rownames(samplelist) = colnames(result)
+
+```
+
+<br>
+
+**Removing low counts from the matrix**
+``` {r message=FALSE}
+
+dds <- DESeqDataSetFromMatrix(df1, sampleTable, ~condition)
+
+ddss <- estimateSizeFactors(dds)
+
+idx <- rowSums( counts(ddss, normalized=TRUE) >= 5 ) >= 3
+
+low_counts_removed <- ddss[idx,]
+
+dds = low_counts_removed
+
+#if you wish to extract normalized counts and write it in csv files.
+
+#normalized_counts = counts(dds, normalized=T)
+#write_csv(normalized_counts, "normalized_counts.csv)")
+```
+<br>
+
+**VST transformation, followed by filtering and Heatmap
+
+``` {r message=FALSE}
+
+vsd <- vst(dds, blind = FALSE)
+
+###for creating Heatmap
+
+vsd.filt <- varFilter(assay(vsd),
+                      var.func=IQR,
+                      var.cutoff=0.5, ##use this wisely, your system may crash!! 
+                      filterByQuantile=TRUE)
+
+dim(vsd.filt) 
+
+
+pheatmap(vsd.filt, # most variable
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         #breaks = c(min(mat, na.rm = TRUE), seq(-3, 3, 6 / (pheatmap_n_colors - 2)), max(mat, na.rm = TRUE)),
+         cluster_rows = TRUE,
+         clustering_distance_rows = "correlation",
+         #clustering_distance_cols = "euclidean",
+         cluster_cols = TRUE,
+         annotation_col = sampleTable,
+         #fontsize_row = 6,
+         fontsize_col = 2,
+         scale = "row",
+         show_colnames = TRUE,
+         show_rownames = FALSE,
+         #legend_breaks=c(-3,0,3),
+         #legend_labels=c("< -3","0","> 3"),
+         #filename=heatName_1
+)
+
+```
+<br>
+
+**For plotting PCA**
+
+```{r message=FALSE}
+
+plotPCA(vsd, intgroup=c("condition"))
+
+```
+<br>
+
+**For UMAP **
+
+```{r message=FALSE}
+
+df2 <- assay(vsd) %>%
+  t() 
+
+umap_results <- umap::umap(df2)
+
+umap_plot_df <- data.frame(umap_results$layout)%>% 
+tibble::rownames_to_column("sample")%>%
+  # Add the metadata into this data frame; match by sample IDs
+  dplyr::inner_join(meta, by = "sample")
+
+
+# Plot using `ggplot()` function
+ggplot(
+  umap_plot_df,
+  aes(
+    x = X1,
+    y = X2,
+    color = Diagnosis,
+    shape = umap_plot_df$`ALT status`
+  )
+) +
+  geom_point(size = 3) 
+
+```
+
+
+**Wilcoxon rank sum test (Run it on the raw counts)**
+
+```{r message=FALSE}
+
+readCount = as.matrix(df1)
+conditions<-factor(t(sampleTable))
+
+#Count matrix preprocessing using edgeR package
+y <- DGEList(counts=readCount,group=conditions)
+##Remove rows consistently have zero or very low counts
+keep <- filterByExpr(y)
+y <- y[keep,keep.lib.sizes=FALSE]
+##Perform TMM normalization and transfer to CPM (Counts Per Million)
+y <- calcNormFactors(y,method="TMM")
+count_norm=cpm(y)
+count_norm<-as.data.frame(count_norm)
+
+
+#Run the Wilcoxon rank-sum test for each gene
+pvalues <- sapply(1:nrow(count_norm),function(i){
+  data<-cbind.data.frame(gene=as.numeric(t(count_norm[i,])),conditions)
+  p=wilcox.test(gene~conditions, data)$p.value
+  return(p)
+})
+fdr=p.adjust(pvalues,method = "fdr")
+
+#Calculate the fold-change for each gene
+
+conditionsLevel<-levels(conditions)
+dataCon1=count_norm[,c(which(conditions==conditionsLevel[1]))]
+dataCon2=count_norm[,c(which(conditions==conditionsLevel[2]))]
+foldChanges=log2(rowMeans(dataCon2)/rowMeans(dataCon1))
+
+
+#Output results based on FDR threshold
+
+outRst<-data.frame(log2foldChange=foldChanges, pValues=pvalues, FDR=fdr)
+rownames(outRst)=rownames(count_norm)
+outRst=na.omit(outRst)
+fdrThres=0.05
+write.table(outRst[outRst$FDR<fdrThres,], file="WilcoxonTest.rst.tsv",sep="\t", quote=F,row.names = T,col.names = T)
+
+
+```
+
